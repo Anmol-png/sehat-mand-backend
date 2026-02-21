@@ -1,99 +1,182 @@
 """
 ============================================================
-  llama_service.py
-  Calls LLaMA 3 via Ollama local API
-  Ollama runs at: http://localhost:11434
+  SEHAT MAND PAKISTAN — llama_service.py
+  + Improved Roman Urdu quality in prompts
 ============================================================
 """
 
+import os
 import requests
-import json
+from groq import Groq
+from dotenv import load_dotenv
+from pathlib import Path
 
-OLLAMA_URL  = "http://localhost:11434/api/generate"
-MODEL_NAME  = "llama3"
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
-# ── Safe system prompt — rules LLaMA must follow ─────────
-SYSTEM_PROMPT = """
-You are a safe and helpful medical assistant for Pakistani users called "Sehat Mand Pakistan".
-You respond in simple Roman Urdu or English depending on what the user writes.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL   = "llama-3.1-8b-instant"
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3"
 
-STRICT RULES — you must ALWAYS follow these:
-1. NEVER confirm or diagnose any disease
-2. NEVER suggest specific medicine brand names (e.g. Panadol, Brufen)
-3. NEVER give exact dosage or tablet count
-4. NEVER write a prescription
-5. ONLY give mild, general lifestyle advice for common symptoms
-6. If user asks for a doctor, ONLY suggest Karachi-based doctors
-7. Always recommend consulting a real doctor for serious issues
-8. Keep responses short, clear, and easy to understand
-9. If symptoms sound serious, always say "Please consult a doctor immediately"
-10. Be empathetic and caring in tone
-
-You are NOT a replacement for a real doctor. Always remind users to consult a qualified physician.
-"""
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-def ask_llama(user_message: str, intent_type: str, context: str = "") -> str:
-    """
-    Sends message to LLaMA 3 via Ollama and returns the response text.
+# ═══════════════════════════════════════════════
+# USER SYSTEM PROMPT — Improved Roman Urdu
+# ═══════════════════════════════════════════════
+USER_SYSTEM = """You are a responsible tele-health AI assistant for Pakistani users.
 
-    Parameters:
-    - user_message : original message from user
-    - intent_type  : 'general' or 'specialist'
-    - context      : doctor list from Firestore (if specialist)
-    """
+LANGUAGE RULES:
+- User writes Roman Urdu → reply in natural Pakistani Roman Urdu.
+- User writes English → reply in English.
+- Sound like a helpful friend, not a textbook.
 
-    # ── Build the full prompt ─────────────────────
-    if intent_type == "specialist" and context:
-        prompt = f"""
-User ne yeh message bheja hai: "{user_message}"
+CONVERSATION RULES:
+- First reply: ask ONE short follow-up question if needed.
+- After user replies → STOP asking. Give advice immediately.
+- If user says "nahi", "sirf yahi", "bas yahi", "kuch nahi" → give advice NOW.
+- NEVER ask more than 1 question total in the whole conversation.
 
-{context}
+RESPONSE FORMAT (always follow this):
+Symptoms ke liye:
+- Zyada pani piyein
+- Rest karein
+- Halki diet follow karein
+(add more relevant tips based on symptoms)
 
-In doctors mein se user ko suggest karein aur unhe batayein ke doctor se milna kyun zaroori hai.
-Apna jawab Roman Urdu ya English mein dein jo user ne use ki ho.
-"""
-    else:
-        prompt = f"""
-User ne yeh symptoms bataye hain: "{user_message}"
+If doctor list is provided → present clearly:
+1. Name – Hospital – Phone
+(briefly explain why this specialist is relevant)
 
-Mild aur safe general advice dein. Koi diagnosis na karein, koi medicine brand na batayein.
-Agar symptoms serious lagte hain to doctor se milne ki salah dein.
-Apna jawab Roman Urdu ya English mein dein jo user ne use ki ho.
-"""
+END every reply with:
+"Agar tabiyat behtar na ho ya symptoms barh jaen to doctor se rabta karein."
 
-    # ── Call Ollama API ───────────────────────────
+STRICT RULES:
+- NEVER diagnose disease by name.
+- NEVER suggest medicine brands or dosages.
+- Only mention mild/common medicine class if very relevant (no dose).
+- NEVER suggest emergency hospital directly.
+- Keep replies under 120 words."""
+
+
+# ═══════════════════════════════════════════════
+# DOCTOR SYSTEM PROMPT
+# ═══════════════════════════════════════════════
+DOCTOR_SYSTEM = """You are a medical AI assistant for Pakistani doctors.
+
+Respond only in professional English.
+
+PERCEPTION LEVELS:
+- Mild: simple advice (rest, hydration, lifestyle)
+- Medium: follow-up needed, dietary adjustment, monitoring
+- High: urgent evaluation recommended
+
+RESPONSE FORMAT:
+Risk Perception: Mild / Medium / High
+
+Clinical Impression:
+
+Key Differentials:
+-
+
+Investigations (if needed):
+-
+
+Management Plan:
+- (lifestyle/dietary advice)
+- (mild medication class only if relevant — no brands, no dose)
+
+Referral:
+- Mention specialist type if needed
+- If referral doctors provided → list them clearly
+- If emergency → ⚠️ URGENT + Call 1122 Karachi
+
+RULES:
+- Do NOT confirm diagnosis.
+- No brand names. No exact dosages.
+- Keep short and clear — under 150 words."""
+
+
+def _call_groq(system: str, messages: list):
+    if not groq_client:
+        return None
     try:
-        payload = {
-            "model"  : MODEL_NAME,
-            "prompt" : prompt,
-            "system" : SYSTEM_PROMPT,
-            "stream" : False,   # get full response at once
-            "options": {
-                "temperature": 0.5,    # lower = more focused, safer responses
-                "num_predict": 300,    # max tokens in response
-            }
-        }
-
-        response = requests.post(
-            OLLAMA_URL,
-            json    = payload,
-            timeout = 60        # 60 second timeout
+        full_messages = [{"role": "system", "content": system}] + messages
+        response = groq_client.chat.completions.create(
+            model       = GROQ_MODEL,
+            messages    = full_messages,
+            temperature = 0.5,
+            max_tokens  = 350,
         )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("response", "Mujhe maafi chahiye, abhi jawab dene mein masla aa raha hai.")
-        else:
-            print(f"[Ollama Error] Status: {response.status_code}")
-            return "Mujhe maafi chahiye, AI service abhi available nahi hai. Baad mein try karein."
-
-    except requests.exceptions.ConnectionError:
-        return "AI service se connection nahi ho pa raha. Please Ollama ko start karein aur dobara try karein."
-
-    except requests.exceptions.Timeout:
-        return "AI service ne time limit se zyada waqt liya. Baad mein try karein."
-
+        print("[AI] ✅ Groq responded")
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[LLaMA Error] {e}")
-        return "Kuch masla aa gaya. Baad mein try karein."
+        print(f"[Groq] ❌ {e}")
+        return None
+
+
+def _call_ollama(system: str, messages: list):
+    try:
+        history_text = ""
+        for m in messages[:-1]:
+            role = "User" if m["role"] == "user" else "Assistant"
+            history_text += f"{role}: {m['content']}\n"
+        last_msg = messages[-1]["content"] if messages else ""
+
+        payload = {
+            "model"  : OLLAMA_MODEL,
+            "system" : system,
+            "prompt" : f"{history_text}User: {last_msg}",
+            "stream" : False,
+            "options": {"temperature": 0.5, "num_predict": 300, "num_ctx": 2048},
+        }
+        r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+        if r.status_code == 200:
+            print("[AI] ✅ Ollama responded")
+            return r.json().get("response", "").strip()
+        return None
+    except requests.exceptions.ConnectionError:
+        print("[Ollama] ❌ Not running")
+        return None
+    except Exception as e:
+        print(f"[Ollama] ❌ {e}")
+        return None
+
+
+def _call_ai(system: str, messages: list):
+    result = _call_groq(system, messages)
+    if result:
+        return result
+    print("[Fallback] 🔄 Switching to Ollama...")
+    return _call_ollama(system, messages)
+
+
+def ask_user_mode(message: str, history: list = None, doctor_context: str = "") -> str:
+    history = history or []
+
+    current_content = message
+    if doctor_context:
+        current_content += f"\n\n[Doctor List]\n{doctor_context}\nPresent this list clearly to the user."
+
+    messages = history + [{"role": "user", "content": current_content}]
+
+    result = _call_ai(USER_SYSTEM, messages)
+    if result:
+        return result
+    return "Service abhi available nahi. Aaram karen, pani piyen, aur doctor se milen agar theek nahi hua."
+
+
+def ask_doctor_mode(message: str, history: list = None, doctor_context: str = "") -> str:
+    history = history or []
+
+    current_content = message
+    if doctor_context:
+        current_content += f"\n\n[Referral Doctors in Karachi]\n{doctor_context}"
+
+    messages = history + [{"role": "user", "content": current_content}]
+
+    result = _call_ai(DOCTOR_SYSTEM, messages)
+    if result:
+        return result
+    return "Clinical AI unavailable. Assess vitals immediately. Emergency: Call 1122 Karachi."
