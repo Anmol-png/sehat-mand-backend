@@ -9,7 +9,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from modules.intent_detector   import detect_intent, detect_clinical_specialty
-from modules.firestore_service import get_doctors_by_specialization
+from modules.firestore_service import get_doctors_by_specialization, warm_up
 from modules.llama_service     import ask_user_mode, ask_doctor_mode
 from modules.safety_filter     import is_emergency, has_restricted_content
 import time
@@ -18,10 +18,9 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Server-side conversation memory ──────────────────────
-# { session_id: { "history": [...], "last_active": timestamp } }
 SESSIONS     = {}
-SESSION_TTL  = 1800  # 30 minutes of inactivity clears session
-MAX_HISTORY  = 10    # keep last 10 turns (20 messages) to avoid token overflow
+SESSION_TTL  = 1800   # 30 minutes
+MAX_HISTORY  = 10     # keep last 10 turns
 
 
 def _get_history(session_id: str) -> list:
@@ -40,13 +39,11 @@ def _save_history(session_id: str, user_msg: str, assistant_msg: str):
     SESSIONS[session_id]["history"].append({"role": "assistant", "content": assistant_msg})
     SESSIONS[session_id]["last_active"] = time.time()
 
-    # Keep only last MAX_HISTORY turns
     if len(SESSIONS[session_id]["history"]) > MAX_HISTORY * 2:
         SESSIONS[session_id]["history"] = SESSIONS[session_id]["history"][-(MAX_HISTORY * 2):]
 
 
 def _cleanup_sessions():
-    """Remove sessions inactive for more than SESSION_TTL seconds."""
     now     = time.time()
     expired = [sid for sid, s in SESSIONS.items() if now - s["last_active"] > SESSION_TTL]
     for sid in expired:
@@ -104,7 +101,6 @@ def chat():
         resp["mode"] = mode
         return jsonify(resp), 200
 
-    # ── Load conversation history from server memory ──────
     history = _get_history(session_id)
     print(f"[Session] id={session_id or 'none'} | history_turns={len(history)//2}")
 
@@ -125,8 +121,6 @@ def chat():
             if raw_docs:
                 doctors = raw_docs
                 context = _format_doctor_context(doctors, specialist)
-            else:
-                context = ""
 
         reply = ask_user_mode(message, history=history, doctor_context=context)
 
@@ -136,7 +130,6 @@ def chat():
                 "nahi kar sakta. Kripaya ek qualified doctor se rabta karein."
             )
 
-        # Save to session memory
         _save_history(session_id, message, reply)
 
         return jsonify({
@@ -182,7 +175,6 @@ def chat():
 
 @app.route("/api/clear", methods=["POST"])
 def clear_session():
-    """Clear conversation memory for a session."""
     data       = request.get_json()
     session_id = (data.get("session_id") or "").strip()
     if session_id and session_id in SESSIONS:
@@ -200,6 +192,9 @@ if __name__ == "__main__":
     print("  SEHAT MAND PAKISTAN — Backend")
     print("  POST /api/chat")
     print("  Body: { message, mode, session_id }")
-    print("  POST /api/clear  → clear session memory")
     print("=" * 55)
+
+    # ── Pre-load Firestore cache before accepting requests ──
+    warm_up()
+
     app.run(debug=True, host="0.0.0.0", port=5000)
