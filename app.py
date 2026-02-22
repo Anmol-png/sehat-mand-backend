@@ -2,6 +2,8 @@
 ============================================================
   SEHAT MAND PAKISTAN — app.py
   + Server-side conversation memory (session_id based)
+  + FREE hospital search via OpenStreetMap Overpass API
+    (no Google billing, no credit card required)
   Body: { "message": "...", "mode": "user"|"doctor", "session_id": "abc123" }
 ============================================================
 """
@@ -12,7 +14,9 @@ from modules.intent_detector   import detect_intent, detect_clinical_specialty
 from modules.firestore_service import get_doctors_by_specialization, warm_up
 from modules.llama_service     import ask_user_mode, ask_doctor_mode
 from modules.safety_filter     import is_emergency, has_restricted_content
+import requests as req
 import time
+import math
 
 app = Flask(__name__)
 CORS(app)
@@ -53,11 +57,11 @@ def _cleanup_sessions():
 EMERGENCY_RESPONSE = {
     "reply": (
         "⚠️ EMERGENCY DETECTED!\n\n"
-        "Foran nazdiki hospital jayein ya yeh numbers call karein:\n"
+        "Please go to the nearest hospital immediately or call:\n"
         "🚑 1122 — Rescue / Ambulance\n"
         "🏥 115  — Edhi Ambulance\n"
         "🚨 1020 — Aman Foundation Karachi\n\n"
-        "Deri mat karein — yeh life threatening ho sakta hai!"
+        "Do not delay — this could be life threatening!"
     ),
     "type"      : "emergency",
     "doctors"   : [],
@@ -81,6 +85,171 @@ def _format_doctor_context(doctors: list, specialist: str) -> str:
     return f"{specialist.title()} doctors in Karachi:\n" + "\n".join(lines)
 
 
+# ── Haversine distance (km) ───────────────────────────────
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1))
+         * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ════════════════════════════════════════════════════════
+#  FREE HOSPITAL SEARCH — GET /api/places/nearby
+#  Uses OpenStreetMap Overpass API (100% free, no key needed)
+#
+#  Query params:
+#    lat    — user latitude  (required)
+#    lng    — user longitude (required)
+#    radius — search radius in metres (optional, default 5000)
+# ════════════════════════════════════════════════════════
+@app.route("/api/places/nearby", methods=["GET"])
+def places_nearby():
+    lat    = request.args.get("lat")
+    lng    = request.args.get("lng")
+    radius = request.args.get("radius", "5000")
+
+    if not lat or not lng:
+        return jsonify({"error": "lat and lng are required"}), 400
+
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+        rad_f = float(radius)
+    except ValueError:
+        return jsonify({"error": "lat, lng, radius must be numbers"}), 400
+
+    print(f"[OSM] Searching hospitals near ({lat_f:.4f}, {lng_f:.4f}) r={rad_f}m")
+
+    # ── Overpass QL query ─────────────────────────────────
+    # Simple fast query — no regex (regex causes server timeouts)
+    overpass_query = (
+        f"[out:json][timeout:25];"
+        f"("
+        f'node["amenity"="hospital"](around:{rad_f},{lat_f},{lng_f});' 
+        f'way["amenity"="hospital"](around:{rad_f},{lat_f},{lng_f});' 
+        f'node["amenity"="clinic"](around:{rad_f},{lat_f},{lng_f});' 
+        f'way["amenity"="clinic"](around:{rad_f},{lat_f},{lng_f});' 
+        f'node["amenity"="doctors"](around:{rad_f},{lat_f},{lng_f});' 
+        f'way["amenity"="doctors"](around:{rad_f},{lat_f},{lng_f});' 
+        f'node["amenity"="health_post"](around:{rad_f},{lat_f},{lng_f});' 
+        f'way["amenity"="health_post"](around:{rad_f},{lat_f},{lng_f});' 
+        f'node["healthcare"](around:{rad_f},{lat_f},{lng_f});' 
+        f'way["healthcare"](around:{rad_f},{lat_f},{lng_f});' 
+        f");out center tags;"
+    )
+
+    # Try multiple Overpass mirrors in case one is down
+    overpass_mirrors = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    ]
+
+    resp = None
+    last_error = None
+
+    for mirror in overpass_mirrors:
+        try:
+            print(f"[OSM] Trying mirror: {mirror}")
+            resp = req.post(
+                mirror,
+                data   = overpass_query.encode("utf-8"),
+                timeout= 20,
+                headers= {"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            resp.raise_for_status()
+            print(f"[OSM] Success from {mirror} | HTTP {resp.status_code}")
+            break  # success — stop trying mirrors
+        except req.exceptions.Timeout:
+            last_error = f"Timeout on {mirror}"
+            print(f"[OSM] Timeout: {mirror}")
+        except Exception as e:
+            last_error = str(e)
+            print(f"[OSM] Error on {mirror}: {e}")
+        resp = None
+
+    if resp is None:
+        return jsonify({"error": f"All OpenStreetMap mirrors failed. Last error: {last_error}"}), 504
+
+    try:
+        osm_data     = resp.json()
+        raw_elements = osm_data.get("elements", [])
+    except Exception as e:
+        print(f"[OSM] JSON parse error: {e} | body: {resp.text[:300]}")
+        return jsonify({"error": f"Invalid response from OpenStreetMap: {str(e)}"}), 500
+
+    print(f"[OSM] Raw elements returned: {len(raw_elements)}")
+
+    results = []
+    seen_names = set()
+
+    for el in raw_elements:
+        tags = el.get("tags", {})
+        name = tags.get("name") or tags.get("name:en") or tags.get("name:ur")
+        if not name:
+            continue  # skip unnamed places
+
+        # Deduplicate by name
+        name_key = name.lower().strip()
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+
+        # Coordinates — nodes have lat/lon directly; ways have "center"
+        if el["type"] == "node":
+            el_lat = el.get("lat", lat_f)
+            el_lng = el.get("lon", lng_f)
+        else:
+            center = el.get("center", {})
+            el_lat = center.get("lat", lat_f)
+            el_lng = center.get("lon", lng_f)
+
+        dist_km = _haversine(lat_f, lng_f, el_lat, el_lng)
+
+        # Build address from tags
+        address_parts = []
+        for key in ["addr:street", "addr:suburb", "addr:city"]:
+            val = tags.get(key)
+            if val:
+                address_parts.append(val)
+        address = ", ".join(address_parts) if address_parts else tags.get("addr:full", "")
+
+        phone = tags.get("phone") or tags.get("contact:phone") or ""
+
+        results.append({
+            "place_id"   : str(el["id"]),
+            "name"       : name,
+            "vicinity"   : address,
+            "phone"      : phone,
+            "geometry"   : {
+                "location": {"lat": el_lat, "lng": el_lng}
+            },
+            "distance_km": round(dist_km, 2),
+            # OSM doesn't provide open/closed hours in most cases
+            "opening_hours": {"open_now": None},
+            "rating"     : None,
+        })
+
+    # Sort by distance
+    results.sort(key=lambda x: x["distance_km"])
+    results = results[:20]  # cap at 20
+
+    print(f"[OSM] Returning {len(results)} hospitals")
+
+    # Return in Google Places-compatible format so Flutter code doesn't change
+    return jsonify({
+        "status" : "OK" if results else "ZERO_RESULTS",
+        "results": results,
+    }), 200
+
+
+# ════════════════════════════════════════════════════════
+#  CHAT — POST /api/chat
+# ════════════════════════════════════════════════════════
 @app.route("/api/chat", methods=["POST"])
 def chat():
     _cleanup_sessions()
@@ -126,8 +295,8 @@ def chat():
 
         if has_restricted_content(reply):
             reply = (
-                "Mujhe khed hai, main yeh specific medical information provide "
-                "nahi kar sakta. Kripaya ek qualified doctor se rabta karein."
+                "I'm sorry, I cannot provide this specific medical information. "
+                "Please consult a qualified doctor."
             )
 
         _save_history(session_id, message, reply)
@@ -158,8 +327,8 @@ def chat():
 
         if has_restricted_content(reply):
             reply = (
-                "Clinical assessment ke liye patient ko directly examine "
-                "karein aur senior physician se consult karein."
+                "For clinical assessment please examine the patient directly "
+                "and consult a senior physician."
             )
 
         _save_history(session_id, message, reply)
@@ -173,6 +342,9 @@ def chat():
         }), 200
 
 
+# ════════════════════════════════════════════════════════
+#  CLEAR SESSION — POST /api/clear
+# ════════════════════════════════════════════════════════
 @app.route("/api/clear", methods=["POST"])
 def clear_session():
     data       = request.get_json()
@@ -182,19 +354,27 @@ def clear_session():
     return jsonify({"status": "cleared"}), 200
 
 
+# ════════════════════════════════════════════════════════
+#  HEALTH CHECK — GET /api/health
+# ════════════════════════════════════════════════════════
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "running", "active_sessions": len(SESSIONS)}), 200
+    return jsonify({
+        "status"         : "running",
+        "active_sessions": len(SESSIONS),
+        "hospital_search": "OpenStreetMap (free, no API key needed)",
+    }), 200
 
 
 if __name__ == "__main__":
     print("=" * 55)
     print("  SEHAT MAND PAKISTAN — Backend")
-    print("  POST /api/chat")
-    print("  Body: { message, mode, session_id }")
+    print("  POST /api/chat          — AI chat")
+    print("  GET  /api/places/nearby — FREE hospital search")
+    print("                            (OpenStreetMap, no billing)")
+    print("  POST /api/clear         — Clear session memory")
+    print("  GET  /api/health        — Health check")
     print("=" * 55)
 
-    # ── Pre-load Firestore cache before accepting requests ──
     warm_up()
-
     app.run(debug=True, host="0.0.0.0", port=5000)
